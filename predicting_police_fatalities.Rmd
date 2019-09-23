@@ -1,0 +1,620 @@
+---
+title: "Predicting Police Fatalities in US Metropolis"
+author: "Kevin Pham"
+date: "June 13, 2019"
+output: html_document
+---
+
+Libraries
+```{r}
+library(readr)
+library(tidyr)
+library(dplyr)
+library(lubridate)
+library(stringr)
+
+```
+
+
+
+```{r, message=FALSE, warning=FALSE}
+train <- read_csv("Police shootings/train.csv")
+test <- read_csv("Police shootings/test.csv")
+
+sapply(train, function(x) sum(is.na(x))) # count of all NAs in each column
+
+# Getting rid of data that has "U" in Fatal
+train <- train[-which(train$Fatal == "U"),]
+
+# # Adding "Fatality" column to testing set with NA values
+# test$Fatal <- NA
+# 
+# # Cleaning training and testing data at the same time
+# alldata <- rbind(test,train)
+
+```
+
+
+
+```{r, message=FALSE, warning=FALSE}
+# We want to get rid of unreliable "1905" dates
+# train <- train %>% mutate(year = as.numeric(format(Date, format = "%Y")),
+#                           month = as.numeric(format(Date, format = "%m")),
+#                           day = as.numeric(format(Date, format = "%d"))
+#                           )
+
+
+train <- separate(data=train, col=Date, sep='/', into = c("month", "day", "year"))
+train <- train[-which(train$year == 1905),]
+
+```
+
+
+
+```{r}
+# Investigating NumberOfOfficers
+max(train$NumberOfOfficers, na.rm = TRUE)
+table(train$NumberOfOfficers)
+sum(prop.table(table(train$NumberOfOfficers))[2:4])
+# About 93% of all police reports in our training set have 1, 2, or 3 officers present at the incident, whether or not a fatality took place. My next question is, should I focus my attention on those incidents where 1-3 officers are present at the incident?
+
+df <- data.frame(numOfficers = as.vector(table(train$NumberOfOfficers, train$Fatal)[,1]), Fatalities = as.vector(table(train$NumberOfOfficers, train$Fatal)[,2])) 
+freq_df <- data.frame(index = 1:length(df[,1]), numOfficers = df[,1]/sum(df[,1]), Fatalities = df[,2]/sum(df[,2]))
+sum(freq_df[2:7,"numOfficers"])
+
+```
+# About 98% of all fatalities in the training set take place when 1-6 officers are present. For now, we will only focus on incidents where less than 7 officers were present at the incident. 
+
+
+
+```{r}
+dim(train) # 2530 obvs
+train <- train[which(train$NumberOfOfficers < 7 & train$NumberOfOfficers > 0), ]
+dim(train) # 2375 obvs
+
+
+# Cleaning OfficerRace, OfficerGender
+table(train$OfficerRace)
+train$OfficerRace <- str_replace_all(train$OfficerRace, c("BLACK" = "B", "WHITE" = "W", "Unknown" = "U", "ASIAN" = "A"))
+train$OfficerRace <- str_replace(train$OfficerRace, " ", "")
+train$OfficerRace1 <- train$OfficerRace # I want to retain OfficerRace in case we need it
+train <- separate(data = train, col = OfficerRace1, sep = ';', into = c("O1Race", "O2Race", "O3Race", "O4Race", "O5Race", "O6Race"), extra = "drop")
+
+train$OfficerGender <- str_replace_all(train$OfficerGender, c("Unknown" = "U"))
+train$OfficerGender1 <- train$OfficerGender
+train <- separate(data=train, OfficerGender1, sep = ";", into = c("O1Gender", "O2Gender", "O3Gender", "O4Gender", "O5Gender", "O6Gender"), extra = "drop")
+```
+
+
+
+
+```{r}
+# Cleaning subject's age
+table(train$SubjectAge) #oh god
+train$SubjectAge <- str_replace_all(train$SubjectAge, c("Juvenile" = '0-19', "N/A" = 'U', "UNKNOWN" = 'U'))
+
+train <- train %>% mutate(SubjectAge = case_when(
+  SubjectAge >= '0' & SubjectAge <= '19.0' & SubjectAge != "U" ~ '0-19',
+  SubjectAge > '19' & SubjectAge <= '29.0' & SubjectAge != "U" ~ '20-29',
+  SubjectAge > '29' & SubjectAge <= '39.0' & SubjectAge != "U" ~ '30-39',
+  SubjectAge > '39' & SubjectAge <= '49.0' & SubjectAge != "U" ~ '40-49',
+  SubjectAge > '49' & SubjectAge <= '59.0' & SubjectAge != "U" ~ '50-59',
+  SubjectAge > '59' & SubjectAge != "U" ~ '60+',
+  TRUE ~ "U"
+))
+```
+
+
+```{r}
+# Removing NAs
+# Cleaning SubjectArmed
+sum(is.na(train$SubjectArmed)) 
+train$SubjectArmed[which(is.na(train$SubjectArmed))] <- 'U'
+table(train$SubjectArmed)
+
+# Cleaning SubjectRace
+sum(is.na(train$SubjectRace))
+train$SubjectRace[which(is.na(train$SubjectRace))] <- 'U'
+table(train$SubjectRace)
+
+# Cleaning OfficerRace
+sum(is.na(train$OfficerRace))
+sum(is.na(train$O1Race))
+train$OfficerRace[which(is.na(train$OfficerRace))] <- 'U'
+train$O1Race[which(is.na(train$O1Race))] <- 'U'
+```
+
+
+
+NatureOfStop, NumberOfShots, NumberOfOfficers, Department, FullNarrative, City, Notes
+```{r}
+train$NatureOfStop <- toupper(train$NatureOfStop)
+train$Notes <- toupper(train$Notes)
+train$FullNarrative <- toupper(train$FullNarrative)
+# table(train$NatureOfStop[-which(is.na(train$NatureOfStop))])
+                         
+train %>% select(Fatal, SubjectArmed, NatureOfStop, Notes) %>% filter(str_detect(NatureOfStop, "MENTAL")) # most nature of stops that involve mental health usually ends in a fatality
+
+train %>% select(Fatal, SubjectArmed, NatureOfStop, Notes) %>% filter(str_detect(NatureOfStop, "ATTEMPT")) # sometimes, there are cases of "suicide by cop", but there's not enough information to tell us when that takes place, if at all
+
+
+# defining different types of crime and misc.
+drug_related <- c("DRUG", "NARCOTIC", "SUBSTANCE")
+property_crime <- c("BURGLARY", "LARCENY", "THEFT", "SHOPLIFT", "STOLE", "THIEF")
+nonviolence <- c("SUICIDE", "SUICIDAL", "MENTAL", "TRAFFIC", "CALL", "WARRANT", "SEARCH", "STOP", "SUSPICIOUS")
+violence <- c("HOMICIDE", "RAPE", "SEXUAL ASSAULT", "ROB", "ASSAULT",
+              "STALKING", "INTIMIDATION", "BATTERY", "SHOOT", "CARJACK",
+              "STAB", "KIDNAP", "HOSTAGE", "STABBED")
+car_involved <- c("CAR", "VEHICLE", "CHASE")
+domestic_related <- c("DOMESTIC", "INVASION", "HOUSE", "HOME")
+nonviolence <- c("TRAFFIC")
+suspicious_nature <- c("SUSPICIOUS")
+armed_crime <- c("ARMED", "WEAPON", "FIREARM")
+mental_health <- c("MENTAL", "CRISIS", "EMOTIONAL", "SUICID")
+suicide_attempt <- c("SUICIDE", "ATTEMPT", "SUICIDAL")
+phone_call <- c("CALL FOR SERVICE", "CALL")
+thief_related <- c("THIEF", "STOLEN", "STOLE", "STEAL", "ROBBERY", "BURGLARY", "SHOPLIFT", "THEFT")
+
+
+# number of observations
+n_train <- nrow(train)
+
+# function to paste according to str_detect() format
+clean_paste <- function(x) {paste(x, collapse = "|")}
+
+# inputting TRUE/FALSE values for strings we want to detect
+train$drug_related <- rep(FALSE, n_train)
+train$drug_related[which(str_detect(train$NatureOfStop, clean_paste(drug_related)))] <- TRUE
+
+train$property_crime <- rep(FALSE, n_train)
+train$property_crime[which(str_detect(train$NatureOfStop, clean_paste(property_crime)))] <- TRUE
+
+train$violence <- rep(FALSE, n_train)
+train$violence[which(str_detect(train$NatureOfStop, clean_paste(violence)))] <- TRUE
+
+train$car_involved <- rep(FALSE, n_train)
+train$car_involved[which(str_detect(train$NatureOfStop, clean_paste(car_involved)))] <- TRUE
+
+train$domestic_related <- rep(FALSE, n_train)
+train$domestic_related[which(str_detect(train$NatureOfStop, clean_paste(domestic_related)))] <- TRUE
+
+train$nonviolence <- rep(FALSE, n_train)
+train$nonviolence[which(str_detect(train$NatureOfStop, clean_paste(nonviolence)))] <- TRUE
+
+train$phone_call <- rep(FALSE, n_train)
+train$phone_call[which(str_detect(train$NatureOfStop, clean_paste(phone_call)))] <- TRUE
+
+train$suspicious_nature <- rep(FALSE, n_train)
+train$suspicious_nature[which(str_detect(train$NatureOfStop, clean_paste(suspicious_nature)))] <- TRUE
+
+train$armed_crime <- rep(FALSE, n_train)
+train$armed_crime[which(str_detect(train$NatureOfStop, clean_paste(armed_crime)))] <- TRUE
+
+train$mental_health <- rep(FALSE, n_train)
+train$mental_health[which(str_detect(train$NatureOfStop, clean_paste(mental_health)))] <- TRUE
+
+train$suicide_attempt <- rep(FALSE, n_train)
+train$suicide_attempt[which(str_detect(train$NatureOfStop, clean_paste(suicide_attempt)))] <- TRUE
+
+train$thief_related <- rep(FALSE, n_train)
+train$thief_related[which(str_detect(train$NatureOfStop, clean_paste(thief_related)))] <- TRUE
+
+train$nonviolence <- rep(FALSE, n_train)
+train$nonviolence[which(str_detect(train$NatureOfStop, clean_paste(nonviolence)))] <- TRUE
+
+
+```
+Looking at BJS' website, I classify NatureOfStop as either drug_related, property_crime, violence, or nonviolence. After further analysis, I also created variables car_involved (whether or not there was a car involved in NatureOfStop), domestic_related, suspicious_nature (if a subject is reported as "SUSPICIOUS"), armed_crime (if they were carrying a firearm), mental health (if NatureOfStop involves mental health/mental crisis) and suicide_attempt (if NatureOfStop involved a suicide attempt, which usually resulted in a fatality), phone_call (if a phone call was involved)
+
+
+
+
+Notes (very messy)
+```{r, message=FALSE, warning=FALSE}
+train$Notes <- toupper(train$Notes)
+no_hits <- c("NO HIT", "NON-HIT", "NO-HIT", "NON-FATAL", "NON FATAL", "NONFATAL")
+train$no_hits <- rep(FALSE, n_train)
+train$no_hits[which(str_detect(train$Notes, clean_paste(no_hits)))] <- TRUE
+
+# train$bbgun <- rep(FALSE, 2375)
+# train$bbgun[which(str_detect(train$Notes, "BB GUN"))] <- TRUE
+```
+
+
+
+FullNarrative (even messier)
+```{r}
+train$FullNarrative <- toupper(train$FullNarrative)
+death_in_narrative <- c("FATAL", "DIED", "DEAD", "DIE", "DOA", "VICTIM", "CASUALTY", "MORTAL", "DECEASE", "KILL", "DEATH", "DECEASE")
+train$death_in_narrative <- rep(FALSE, n_train)
+train$death_in_narrative[which(str_detect(train$FullNarrative, clean_paste(death_in_narrative)))] <- TRUE
+
+
+```
+
+
+
+NumberOfShots
+```{r}
+train <- train %>% mutate(Shots = case_when(
+  NumberOfShots == 'not clear' | NumberOfShots == 'Unknown' | NumberOfShots == "no information" | NumberOfShots == "U" ~ 'U',
+  NumberOfShots == "1*" | NumberOfShots == "1" | NumberOfShots == ">/=1" | NumberOfShots == "2" | NumberOfShots == "0;2;0" 
+    |   NumberOfShots == "1;1" | NumberOfShots == ">1" | NumberOfShots == "Multiple" | NumberOfShots == ">/=2" 
+    | NumberOfShots == "3" | NumberOfShots == ">2" | NumberOfShots == ">/=3" | NumberOfShots == "4" 
+    | NumberOfShots == ">/=4" | NumberOfShots == "5" | NumberOfShots == ">4" | NumberOfShots == "2;3" ~ "1-5",
+  NumberOfShots == ">/=5" | NumberOfShots == "6" |NumberOfShots == "7" | NumberOfShots == "8" | NumberOfShots == "9" 
+    | NumberOfShots == "10" | NumberOfShots == "5;4" ~ "6-10",
+  NumberOfShots == ">/=12" | NumberOfShots == "11" | NumberOfShots == "12" | NumberOfShots == "13" 
+    | NumberOfShots == "14" | NumberOfShots == "15" | NumberOfShots == "8;5" 
+    | NumberOfShots == ">/=12" ~ "11-15",
+  NumberOfShots == "16" | NumberOfShots == "17" | NumberOfShots == "18" | NumberOfShots == "19" 
+    | NumberOfShots == "20" | NumberOfShots == "9;9;1" | NumberOfShots == "13;4"~ "16-20",
+  NumberOfShots == ">/=20" | NumberOfShots == "21" | NumberOfShots == "22" | NumberOfShots == "23" 
+    | NumberOfShots == "24" | NumberOfShots == "25" | NumberOfShots == "26" | NumberOfShots == "27" 
+    | NumberOfShots == "28" | NumberOfShots == "29" | NumberOfShots == "30" | NumberOfShots == "5;8;6;4;6" 
+    | NumberOfShots == "13;9" | NumberOfShots == "16;2;1;2" ~ "21-30",
+  NumberOfShots == "31" | NumberOfShots == "34" | NumberOfShots == "4;14;16" | NumberOfShots == "40" 
+    | NumberOfShots == "42859" | NumberOfShots == "43" | NumberOfShots == "45" | NumberOfShots == "46" 
+    | NumberOfShots == "52" | NumberOfShots == "62" | NumberOfShots == "65" | NumberOfShots == "72" 
+    | NumberOfShots == "16;16;2;12" ~ "30+",
+  TRUE ~ NA_character_
+)) 
+
+
+```
+
+
+
+
+City, Department
+```{r}
+# mappingpoliceviolence.org 
+top25_departments <- c("St. Louis", "Phoenix", "Kansas City", "Columbus", "Albuquerque", "Baltimore", "Tucson", "Jacksonville")
+top10_police <- c("ALBUQUERQUE", "LASVEGAS", "WASHINGTON DC", "PHOENIX", "TUCSON", "LOSANGELES", "SANJOSE", "SAN FRANCISCO", "SANDIEGO", "FAIRFAXCOUNTY")
+top25_poverty <- c("COLUMBUS", "ALBUQUERQUE", "NEWORLEANS", "WASHINGTON DC", "LOUISVILLE", "WASHINGTON DC", "NASHVILLE", "MEMPHIS", "ATLANTA", "PHOENIX", "TUCSON", "HOUSTON", "DALLAS", "AUSTIN", "SAN ANTONION", "EL PASO", "FORT WORTH", "NEW YORK", "MIAMI", "JACKSONVILLE", "INDIANAPOLIS", "ST. LOUIS", "KANSAS CITY", "LOSANGELES", "SANJOSE", "SAN FRANCISCO", "SANDIEGO", "FAIRFAXCOUNTY", "PORTLAND", "LASVEGAS")
+
+
+# rates of police killings by state, 2013-2018
+train$top_state <- rep(FALSE, n_train)
+
+# police departments bearing most responsibility for police violence, 2013-2018
+train$top25_departments <- rep(FALSE, n_train)
+train$top25_departments[which(str_detect(train$Department, clean_paste(top25_departments)))] <- TRUE
+
+# top10_police states with highest rates of police violence
+train$top10_police <- rep(FALSE, n_train)
+train %>% select(City, Department) %>% filter(str_detect(train$City, "WASHINGTON DC"))
+train$top10_police[which(str_detect(train$City,clean_paste(top10_states)))] <- TRUE
+
+# us states by poverty rate, 2017
+# source: wiki
+train$top25_poverty <- rep(FALSE, n_train)
+
+train$top25_poverty[which(str_detect(train$City, clean_paste(top25_poverty)))] <- TRUE
+```
+
+
+
+
+Type Conversion
+```{r, warning=T}
+  names(train)
+  train$id <- factor(train$id)
+  train$NumberOfSubjects <- factor(train$NumberOfSubjects)
+  train$SubjectArmed <- factor(train$SubjectArmed)
+  train$SubjectRace <- factor(train$SubjectRace)
+  train$SubjectGender <- factor(train$SubjectGender)
+  train$Age <- factor(train$Age)
+  train$NumberOfOfficers <- factor(train$NumberOfOfficers)
+  train$OfficerRace <- factor(train$OfficerRace)
+  train$OfficerGender <- factor(train$OfficerGender)
+  train$O1Gender <- factor(train$O1Gender)
+  train$O2Gender <- factor(train$O2Gender)
+  train$O3Gender <- factor(train$O3Gender)
+  train$O4Gender <- factor(train$O4Gender)
+  train$O5Gender <- factor(train$O5Gender)
+  train$O6Gender <- factor(train$O6Gender)
+  train$O1Race <- factor(train$O1Race)
+  train$O2Race <- factor(train$O2Race)
+  train$O3Race <- factor(train$O3Race)
+  train$O4Race <- factor(train$O4Race)
+  train$O5Race <- factor(train$O5Race)
+  train$O6Race <- factor(train$O6Race)
+  train$Shots <- factor(train$Shots)
+  train$Fatal <- factor(train$Fatal)
+
+
+```
+
+
+
+
+
+```{r}
+# set.seed(5)
+# 
+# # randomforest
+# library(randomForest)
+# m3 <- randomForest(Fatal ~ SubjectArmed + SubjectRace + SubjectGender + Age + O1Race + thief_related + domestic_related + no_hits + death_in_narrative + mental_health + top10_police + top25_poverty + top25_departments + O1Gender + nonviolence,
+#                    data = train, mtry = 3, importance = TRUE, na.action = na.exclude)
+# print(m3)
+# 
+# # Inspecting OOB error matrix
+# err <- m3$err.rate
+# head(err)
+# 
+# # final OOB error rate (last row in err matrix)
+# oob_err <- err[nrow(err), "OOB"]
+# print(oob_err)
+# 
+# 
+# importance <- importance(m3)
+# varImpPlot(m3)
+# 
+# # Plotting Model
+# plot(m3)
+# legend(x = "right", legend = colnames(err), fill = 1:ncol(err))
+
+# # varImpPlot tells us which variables the model believes to be more important when predicting a fatality.
+```
+
+
+
+
+
+PART B) Cleaning Test Data
+```{r}
+test <- read_csv("Police shootings/test.csv")
+test <- test %>% mutate(year = as.numeric(format(Date, format = "%Y")),
+                          month = as.numeric(format(Date, format = "%m")),
+                          day = as.numeric(format(Date, format = "%d"))
+                          )
+
+
+# test <- separate(data=test, col=Date, sep='/', into = c("month", "day", "year"))
+
+
+
+# Cleaning OfficerRace, OfficerGender
+test$OfficerRace <- str_replace_all(test$OfficerRace, c("BLACK" = "B", "WHITE" = "W", "Unknown" = "U", "ASIAN" = "A"))
+test$OfficerRace <- str_replace(test$OfficerRace, " ", "")
+test$OfficerRace1 <- test$OfficerRace # I want to retain OfficerRace in case we need it
+test <- separate(data = test, col = OfficerRace1, sep = ';', into = c("O1Race", "O2Race", "O3Race", "O4Race", "O5Race", "O6Race"), extra = "drop")
+
+test$OfficerGender <- str_replace_all(test$OfficerGender, c("Unknown" = "U"))
+test$OfficerGender1 <- test$OfficerGender
+test <- separate(data=test, OfficerGender1, sep = ";", into = c("O1Gender", "O2Gender", "O3Gender", "O4Gender", "O5Gender", "O6Gender"), extra = "drop")
+
+
+# Cleaning subject's age
+test$SubjectAge <- str_replace_all(test$SubjectAge, c("Juvenile" = '0-19', "N/A" = 'U', "UNKNOWN" = 'U'))
+
+test <- test %>% mutate(Age = case_when(
+  SubjectAge >= '0' & SubjectAge <= '19.0' & SubjectAge != "U" ~ '0-19',
+  SubjectAge > '19' & SubjectAge <= '29.0' & SubjectAge != "U" ~ '20-29',
+  SubjectAge > '29' & SubjectAge <= '39.0' & SubjectAge != "U" ~ '30-39',
+  SubjectAge > '39' & SubjectAge <= '49.0' & SubjectAge != "U" ~ '40-49',
+  SubjectAge > '49' & SubjectAge <= '59.0' & SubjectAge != "U" ~ '50-59',
+  SubjectAge > '59' & SubjectAge != "U" ~ '60+',
+  TRUE ~ "U"
+))
+
+
+# Cleaning SubjectArmed
+sum(is.na(test$SubjectArmed)) 
+test$SubjectArmed[which(is.na(test$SubjectArmed))] <- 'U'
+
+# Cleaning SubjectRace
+sum(is.na(test$SubjectRace))
+test$SubjectRace[which(is.na(test$SubjectRace))] <- 'U'
+
+# Cleaning OfficerRace
+test$OfficerRace[which(is.na(test$OfficerRace))] <- 'U'
+test$O1Race[which(is.na(test$O1Race))] <- 'U'
+
+
+# Cleaning NatureOfStop
+test$NatureOfStop <- toupper(test$NatureOfStop)
+test$Notes <- toupper(test$Notes)
+test$FullNarrative <- toupper(test$FullNarrative)
+                       
+
+# defining different types of crime and misc.
+drug_related <- c("DRUG", "NARCOTIC", "SUBSTANCE")
+property_crime <- c("BURGLARY", "LARCENY", "THEFT", "SHOPLIFT", "STOLE", "THIEF")
+nonviolence <- c("SUICIDE", "SUICIDAL", "MENTAL", "TRAFFIC", "CALL", "WARRANT", "SEARCH", "STOP", "SUSPICIOUS")
+violence <- c("HOMICIDE", "RAPE", "SEXUAL ASSAULT", "ROB", "ASSAULT",
+              "STALKING", "INTIMIDATION", "BATTERY", "SHOOT", "CARJACK",
+              "STAB", "KIDNAP", "HOSTAGE", "STABBED")
+car_involved <- c("CAR", "VEHICLE", "CHASE")
+domestic_related <- c("DOMESTIC", "INVASION", "HOUSE", "HOME")
+nonviolence <- c("TRAFFIC")
+suspicious_nature <- c("SUSPICIOUS")
+armed_crime <- c("ARMED", "WEAPON", "FIREARM")
+mental_health <- c("MENTAL", "CRISIS", "EMOTIONAL", "SUICID")
+suicide_attempt <- c("SUICIDE", "ATTEMPT", "SUICIDAL")
+phone_call <- c("CALL FOR SERVICE", "CALL")
+thief_related <- c("THIEF", "STOLEN", "STOLE", "STEAL", "ROBBERY", "BURGLARY", "SHOPLIFT", "THEFT")
+
+
+# number of observations
+n_test <- nrow(test)
+
+# function to paste according to str_detect() format
+clean_paste <- function(x) {paste(x, collapse = "|")}
+
+# detecting different types of crimes from "Notes"
+test$drug_related <- rep(FALSE, n_test)
+test$drug_related[which(str_detect(test$NatureOfStop, clean_paste(drug_related)))] <- TRUE
+
+test$property_crime <- rep(FALSE, n_test)
+test$property_crime[which(str_detect(test$NatureOfStop, clean_paste(property_crime)))] <- TRUE
+
+test$violence <- rep(FALSE, n_test)
+test$violence[which(str_detect(test$NatureOfStop, clean_paste(violence)))] <- TRUE
+
+test$car_involved <- rep(FALSE, n_test)
+test$car_involved[which(str_detect(test$NatureOfStop, clean_paste(car_involved)))] <- TRUE
+
+test$domestic_related <- rep(FALSE, n_test)
+test$domestic_related[which(str_detect(test$NatureOfStop, clean_paste(domestic_related)))] <- TRUE
+
+test$nonviolence <- rep(FALSE, n_test)
+test$nonviolence[which(str_detect(test$NatureOfStop, clean_paste(nonviolence)))] <- TRUE
+
+test$phone_call <- rep(FALSE, n_test)
+test$phone_call[which(str_detect(test$NatureOfStop, clean_paste(phone_call)))] <- TRUE
+
+test$suspicious_nature <- rep(FALSE, n_test)
+test$suspicious_nature[which(str_detect(test$NatureOfStop, clean_paste(suspicious_nature)))] <- TRUE
+
+test$armed_crime <- rep(FALSE, n_test)
+test$armed_crime[which(str_detect(test$NatureOfStop, clean_paste(armed_crime)))] <- TRUE
+
+test$mental_health <- rep(FALSE, n_test)
+test$mental_health[which(str_detect(test$NatureOfStop, clean_paste(mental_health)))] <- TRUE
+
+test$suicide_attempt <- rep(FALSE, n_test)
+test$suicide_attempt[which(str_detect(test$NatureOfStop, clean_paste(suicide_attempt)))] <- TRUE
+
+test$suspicious_nature <- rep(FALSE, n_test)
+test$suspicious_nature[which(str_detect(test$NatureOfStop, clean_paste(suspicious_nature)))] <- TRUE
+
+
+
+
+# Cleaning Notes by finding "no hits"
+test$Notes <- toupper(test$Notes)
+no_hits <- c("NO HIT", "NON-HIT", "NO-HIT", "NON-FATAL", "NON FATAL", "NONFATAL")
+test$no_hits <- rep(FALSE, n_test)
+test$no_hits[which(str_detect(test$Notes, clean_paste(no_hits)))] <- TRUE
+
+# Cleaning FullNarrative by finding fatalities
+test$FullNarrative <- toupper(test$FullNarrative)
+death_in_narrative <- c("FATAL", "DIED", "DEAD", "DIE", "DOA", "VICTIM", "CASUALTY", "MORTAL", "DECEASE", "KILL", "DEATH", "DECEASE")
+test$death_in_narrative <- rep(FALSE, n_test)
+test$death_in_narrative[which(str_detect(test$FullNarrative, clean_paste(death_in_narrative)))] <- TRUE
+
+
+
+
+
+
+# mappingpoliceviolence.org 
+top25_departments <- c("St. Louis", "Phoenix", "Kansas City", "Columbus", "Albuquerque", "Baltimore", "Tucson", "Jacksonville")
+top10_police <- c("ALBUQUERQUE", "LASVEGAS", "WASHINGTON DC", "PHOENIX", "TUCSON", "LOSANGELES", "SANJOSE", "SAN FRANCISCO", "SANDIEGO", "FAIRFAXCOUNTY")
+top25_poverty <- c("COLUMBUS", "ALBUQUERQUE", "NEWORLEANS", "WASHINGTON DC", "LOUISVILLE", "WASHINGTON DC", "NASHVILLE", "MEMPHIS", "ATLANTA", "PHOENIX", "TUCSON", "HOUSTON", "DALLAS", "AUSTIN", "SAN ANTONION", "EL PASO", "FORT WORTH", "NEW YORK", "MIAMI", "JACKSONVILLE", "INDIANAPOLIS", "ST. LOUIS", "KANSAS CITY", "LOSANGELES", "SANJOSE", "SAN FRANCISCO", "SANDIEGO", "FAIRFAXCOUNTY", "PORTLAND", "LASVEGAS")
+
+# top cities for police violence
+test$top_city <- rep(FALSE, n_test)
+test$top_city[which(str_detect(test$City, clean_paste(top_city)))] <- TRUE
+
+# rates of police killings by state, 2013-2018
+test$top_state <- rep(FALSE, n_test)
+
+# police departments bearing most responsibility for police violence, 2013-2018
+test$top25_departments <- rep(FALSE, n_test)
+test$top25_departments[which(str_detect(test$Department, clean_paste(top25_departments)))] <- TRUE
+
+# top10_police states with highest rates of police violence
+test$top10_police <- rep(FALSE, n_test)
+
+test$top10_police[which(str_detect(test$City,clean_paste(top10_states)))] <- TRUE
+
+# us states by poverty rate, 2017
+# source: wiki
+test$top25_poverty <- rep(FALSE, n_test)
+test$top25_poverty[which(str_detect(test$City, clean_paste(top25_poverty)))] <- TRUE
+
+# Cleaning NumberOfShots
+test <- test %>% mutate(Shots = case_when(
+  NumberOfShots == 'not clear' | NumberOfShots == 'Unknown' | NumberOfShots == "no information" | NumberOfShots == "U" ~ 'U',
+  NumberOfShots == "1*" | NumberOfShots == "1" | NumberOfShots == ">/=1" | NumberOfShots == "2" | NumberOfShots == "0;2;0" 
+    |   NumberOfShots == "1;1" | NumberOfShots == ">1" | NumberOfShots == "Multiple" | NumberOfShots == ">/=2" 
+    | NumberOfShots == "3" | NumberOfShots == ">2" | NumberOfShots == ">/=3" | NumberOfShots == "4" 
+    | NumberOfShots == ">/=4" | NumberOfShots == "5" | NumberOfShots == ">4" | NumberOfShots == "2;3" ~ "1-5",
+  NumberOfShots == ">/=5" | NumberOfShots == "6" |NumberOfShots == "7" | NumberOfShots == "8" | NumberOfShots == "9" 
+    | NumberOfShots == "10" | NumberOfShots == "5;4" ~ "6-10",
+  NumberOfShots == ">/=12" | NumberOfShots == "11" | NumberOfShots == "12" | NumberOfShots == "13" 
+    | NumberOfShots == "14" | NumberOfShots == "15" | NumberOfShots == "8;5" 
+    | NumberOfShots == ">/=12" ~ "11-15",
+  NumberOfShots == "16" | NumberOfShots == "17" | NumberOfShots == "18" | NumberOfShots == "19" 
+    | NumberOfShots == "20" | NumberOfShots == "9;9;1" | NumberOfShots == "13;4"~ "16-20",
+  NumberOfShots == ">/=20" | NumberOfShots == "21" | NumberOfShots == "22" | NumberOfShots == "23" 
+    | NumberOfShots == "24" | NumberOfShots == "25" | NumberOfShots == "26" | NumberOfShots == "27" 
+    | NumberOfShots == "28" | NumberOfShots == "29" | NumberOfShots == "30" | NumberOfShots == "5;8;6;4;6" 
+    | NumberOfShots == "13;9" | NumberOfShots == "16;2;1;2" ~ "21-30",
+  NumberOfShots == "31" | NumberOfShots == "34" | NumberOfShots == "4;14;16" | NumberOfShots == "40" 
+    | NumberOfShots == "42859" | NumberOfShots == "43" | NumberOfShots == "45" | NumberOfShots == "46" 
+    | NumberOfShots == "52" | NumberOfShots == "62" | NumberOfShots == "65" | NumberOfShots == "72" 
+    | NumberOfShots == "16;16;2;12" ~ "30+",
+  TRUE ~ NA_character_
+)) 
+
+
+
+  test$id <- factor(test$id)
+  test$NumberOfSubjects <- factor(test$NumberOfSubjects)
+  test$SubjectArmed <- factor(test$SubjectArmed)
+  test$SubjectRace <- factor(test$SubjectRace)
+  test$SubjectGender <- factor(test$SubjectGender)
+  test$Age <- factor(test$Age)
+  test$NumberOfOfficers <- factor(test$NumberOfOfficers)
+  test$OfficerRace <- factor(test$OfficerRace)
+  test$OfficerGender <- factor(test$OfficerGender)
+  test$O1Race <- factor(test$O1Race)
+  test$O2Race <- factor(test$O2Race)
+  test$O3Race <- factor(test$O3Race)
+  test$O4Race <- factor(test$O4Race)
+  test$O5Race <- factor(test$O5Race)
+  test$O6Race <- factor(test$O6Race)
+  test$O1Gender <- factor(test$O1Gender)
+  test$O2Gender <- factor(test$O2Gender)
+  test$Shots <- factor(test$Shots)
+  
+  
+
+  
+  
+
+```
+
+
+
+
+PART C) TESTING
+```{r}
+set.seed(5)
+
+library(tree)
+m2 <- tree(Fatal ~ SubjectArmed + SubjectRace + SubjectGender + Age + O1Race + thief_related + domestic_related + no_hits + death_in_narrative + mental_health + top10_police + top25_poverty + top25_departments + O1Gender + nonviolence, 
+                   data = train, mindev = 0.001)
+summary(m2)
+
+
+#making predictions
+probs <- predict(m1, newdata = test, type = "class")
+probs <- as.character(probs)
+probs[probs == "N"] <- "No"
+probs[probs == "F"] <- "Yes"
+
+
+probs <- predict(m2, newdata = test, type = "class")
+probs <- as.character(probs)
+probs[probs == "N"] <- "No"
+probs[probs == "F"] <- "Yes"
+submission <- data.frame(test$id, probs)
+names(submission) <- c("id", "Fatal")
+
+
+write.csv(submission, file = "submission.csv", row.names = FALSE, col.names = c("id", "Fatal"))
+```
+
+
+
+
+
+
+
+
+
